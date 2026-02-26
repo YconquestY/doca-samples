@@ -30,6 +30,7 @@
 #include <doca_flow_net.h>
 
 #include <flow_common.h>
+#include <flow_switch_common.h>
 
 DOCA_LOG_REGISTER(FLOW_DSCP);
 
@@ -313,16 +314,15 @@ static void print_dscp_stats_wrapper(void *context)
 	print_dscp_stats(ctx);
 }
 
-doca_error_t flow_dscp(int nb_queues, uint8_t dscp)
+doca_error_t flow_dscp(int nb_queues, struct flow_switch_ctx *ctx, uint8_t dscp)
 {
-	const int nb_ports = 1;
+	int nb_ports;
 	struct flow_resources resource = {
 		.mode = DOCA_FLOW_RESOURCE_MODE_PORT,
 		.nr_counters = FLOW_DSCP_NUM_COUNTERS,
 	};
 	uint32_t nr_shared_resources[SHARED_RESOURCE_NUM_VALUES] = {0};
-	struct doca_flow_port *ports[nb_ports];
-	uint32_t actions_mem_size[nb_ports];
+	struct doca_flow_port *switch_port = NULL;
 	struct entries_status status = {0};
 	struct doca_flow_target *kernel_target;
 	struct doca_flow_pipe *root_pipe = NULL;
@@ -332,18 +332,44 @@ doca_error_t flow_dscp(int nb_queues, uint8_t dscp)
 	struct dscp_stats_context stats_ctx = {.dscp = dscp};
 	doca_error_t result;
 
-	result = init_doca_flow(nb_queues, "vnf,isolated,hws", &resource, nr_shared_resources);
+	if (ctx == NULL) {
+		DOCA_LOG_ERR("Invalid switch context");
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+	nb_ports = ctx->devs_ctx.nb_ports;
+	if (nb_ports <= 0) {
+		DOCA_LOG_ERR("Invalid number of switch ports: %d", nb_ports);
+		return DOCA_ERROR_INVALID_VALUE;
+	}
+
+	struct doca_flow_port *ports[nb_ports];
+	uint32_t actions_mem_size[nb_ports];
+
+	result = init_doca_flow(nb_queues, "switch,hws,isolated", &resource, nr_shared_resources);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init DOCA Flow: %s", doca_error_get_descr(result));
 		return result;
 	}
 
 	ARRAY_INIT(actions_mem_size, ACTIONS_MEM_SIZE(FLOW_DSCP_NUM_ENTRIES));
-	result = init_doca_flow_vnf_ports(nb_ports, ports, actions_mem_size, &resource);
+	result = init_doca_flow_switch_ports(ctx->devs_ctx.devs_manager,
+					     ctx->devs_ctx.nb_devs,
+					     ports,
+					     nb_ports,
+					     actions_mem_size,
+					     &resource);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init DOCA ports: %s", doca_error_get_descr(result));
 		doca_flow_destroy();
 		return result;
+	}
+
+	switch_port = doca_flow_port_switch_get(ports[0]);
+	if (switch_port == NULL) {
+		DOCA_LOG_ERR("Failed to get switch port");
+		stop_doca_flow_ports(nb_ports, ports);
+		doca_flow_destroy();
+		return DOCA_ERROR_BAD_STATE;
 	}
 
 	result = doca_flow_get_target(DOCA_FLOW_TARGET_KERNEL, &kernel_target);
@@ -354,7 +380,7 @@ doca_error_t flow_dscp(int nb_queues, uint8_t dscp)
 		return result;
 	}
 
-	result = create_rocev2_dscp_pipe(ports[0],
+	result = create_rocev2_dscp_pipe(switch_port,
 					 kernel_target,
 					 dscp,
 					 &status,
@@ -367,14 +393,14 @@ doca_error_t flow_dscp(int nb_queues, uint8_t dscp)
 		return result;
 	}
 
-	result = create_root_rocev2_pipe(ports[0], dscp_pipe, &status, &root_pipe);
+	result = create_root_rocev2_pipe(switch_port, dscp_pipe, &status, &root_pipe);
 	if (result != DOCA_SUCCESS) {
 		stop_doca_flow_ports(nb_ports, ports);
 		doca_flow_destroy();
 		return result;
 	}
 
-	result = flow_process_entries(ports[0], &status, FLOW_DSCP_NUM_ENTRIES);
+	result = flow_process_entries(switch_port, &status, FLOW_DSCP_NUM_ENTRIES);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to process entries: %s", doca_error_get_descr(result));
 		stop_doca_flow_ports(nb_ports, ports);

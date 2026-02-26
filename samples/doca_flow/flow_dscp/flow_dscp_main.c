@@ -31,6 +31,7 @@
 #include <doca_log.h>
 
 #include <flow_common.h>
+#include <flow_switch_common.h>
 
 #include <dpdk_utils.h>
 
@@ -40,24 +41,12 @@ DOCA_LOG_REGISTER(FLOW_DSCP::MAIN);
 #define FLOW_DSCP_MAX (63)
 
 struct flow_dscp_cfg {
-	struct flow_dev_ctx flow_dev_ctx;
+	struct flow_switch_ctx switch_ctx;
 	int dscp;
 };
 
 /* Sample's Logic */
-doca_error_t flow_dscp(int nb_queues, uint8_t dscp);
-
-static doca_error_t nic_callback(void *param, void *opaque)
-{
-	struct flow_dscp_cfg *cfg = (struct flow_dscp_cfg *)opaque;
-
-	if (cfg->flow_dev_ctx.nb_ports >= 1) {
-		DOCA_LOG_ERR("Only one --nic value is supported");
-		return DOCA_ERROR_INVALID_VALUE;
-	}
-
-	return flow_param_dev_callback(param, &cfg->flow_dev_ctx);
-}
+doca_error_t flow_dscp(int nb_queues, struct flow_switch_ctx *ctx, uint8_t dscp);
 
 static doca_error_t dscp_callback(void *param, void *opaque)
 {
@@ -76,26 +65,7 @@ static doca_error_t dscp_callback(void *param, void *opaque)
 static doca_error_t register_sample_params(void)
 {
 	doca_error_t result;
-	struct doca_argp_param *nic_param;
 	struct doca_argp_param *dscp_param;
-
-	result = doca_argp_param_create(&nic_param);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to create nic parameter: %s", doca_error_get_descr(result));
-		return result;
-	}
-	doca_argp_param_set_short_name(nic_param, "n");
-	doca_argp_param_set_long_name(nic_param, "nic");
-	doca_argp_param_set_arguments(nic_param, "<DEVICE-ADDRESS>");
-	doca_argp_param_set_description(nic_param, "Receiver NIC device (for example: aux/2,dv_flow_en=2)");
-	doca_argp_param_set_callback(nic_param, nic_callback);
-	doca_argp_param_set_type(nic_param, DOCA_ARGP_TYPE_DEVICE);
-	doca_argp_param_set_mandatory(nic_param);
-	result = doca_argp_register_param(nic_param);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to register nic parameter: %s", doca_error_get_descr(result));
-		return result;
-	}
 
 	result = doca_argp_param_create(&dscp_param);
 	if (result != DOCA_SUCCESS) {
@@ -132,8 +102,9 @@ int main(int argc, char **argv)
 	int exit_status = EXIT_FAILURE;
 	struct flow_dscp_cfg app_cfg = {.dscp = -1};
 	struct application_dpdk_config dpdk_config = {
-		.port_config.nb_ports = 1,
+		.port_config.nb_ports = 0,
 		.port_config.nb_queues = 1,
+		.port_config.switch_mode = 1,
 	};
 
 	/* Register a logger backend */
@@ -163,6 +134,12 @@ int main(int argc, char **argv)
 		goto argp_cleanup;
 	}
 
+	result = register_doca_flow_switch_params();
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to register flow switch parameters: %s", doca_error_get_descr(result));
+		goto argp_cleanup;
+	}
+
 	result = register_flow_stats_params();
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to register stats parameters: %s", doca_error_get_descr(result));
@@ -170,22 +147,25 @@ int main(int argc, char **argv)
 	}
 
 	doca_argp_set_dpdk_program(flow_init_dpdk);
+	app_cfg.switch_ctx.devs_ctx.default_dev_args = FLOW_SWITCH_DEV_ARGS;
 	result = doca_argp_start(argc, argv);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to parse sample input: %s", doca_error_get_descr(result));
 		goto argp_cleanup;
 	}
 
-	if (app_cfg.flow_dev_ctx.nb_ports != 1) {
-		DOCA_LOG_ERR("Exactly one --nic value is required");
+	if (app_cfg.switch_ctx.devs_ctx.nb_ports == 0) {
+		DOCA_LOG_ERR("At least one flow device (and optional representors) must be provided");
 		goto argp_cleanup;
 	}
 
-	result = init_doca_flow_devs(&app_cfg.flow_dev_ctx);
+	result = init_doca_flow_devs(&app_cfg.switch_ctx.devs_ctx);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("Failed to init flow devices: %s", doca_error_get_descr(result));
 		goto argp_cleanup;
 	}
+
+	dpdk_config.port_config.nb_ports = app_cfg.switch_ctx.devs_ctx.nb_ports;
 
 	/* update queues and ports */
 	result = dpdk_queues_and_ports_init(&dpdk_config);
@@ -195,7 +175,7 @@ int main(int argc, char **argv)
 	}
 
 	/* run sample */
-	result = flow_dscp(dpdk_config.port_config.nb_queues, (uint8_t)app_cfg.dscp);
+	result = flow_dscp(dpdk_config.port_config.nb_queues, &app_cfg.switch_ctx, (uint8_t)app_cfg.dscp);
 	if (result != DOCA_SUCCESS) {
 		DOCA_LOG_ERR("flow_dscp() encountered an error: %s", doca_error_get_descr(result));
 		goto dpdk_ports_queues_cleanup;
@@ -206,10 +186,11 @@ int main(int argc, char **argv)
 dpdk_ports_queues_cleanup:
 	dpdk_queues_and_ports_fini(&dpdk_config);
 dpdk_cleanup:
-	dpdk_fini_with_devs(dpdk_config.port_config.nb_ports);
+	dpdk_fini();
 argp_cleanup:
 	doca_argp_destroy();
 sample_exit:
+	destroy_doca_flow_devs(&app_cfg.switch_ctx.devs_ctx);
 	if (exit_status == EXIT_SUCCESS)
 		DOCA_LOG_INFO("Sample finished successfully");
 	else

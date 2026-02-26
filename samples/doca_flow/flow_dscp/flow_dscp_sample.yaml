@@ -22,11 +22,14 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
-number_of_ports: 1
+number_of_ports: 2
 mode_args:
-  - vnf
+  - switch
+ports_description:
+  port_0: doca_dev
+  port_1: doca_rep_dev
 description: "The sample installs a receiver-side ingress control pipe for RoCEv2 traffic and tracks two counters:
               (1) packets with DSCP equal to the configured value, and
               (2) packets with any other DSCP value.
               Sample command line:
-              ./build/doca_flow_dscp -- -n aux/2,dv_flow_en=2 -d 16 -l 60"
+              ./build/doca_flow_dscp -- -a pci/08:00.0 -r pci/08:00.0,pf0sf[0-1] -d 16 -l 60"
